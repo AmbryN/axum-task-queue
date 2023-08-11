@@ -7,110 +7,64 @@ use axum_macros::debug_handler;
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
-    sync::{mpsc::Sender, Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
     time::Duration,
 };
-use tracing::instrument::WithSubscriber;
 
 struct AppState {
-    current_number_tasks: u8,
-    index: usize,
-    queue: Queue,
+    queue: RwLock<Queue>,
+    finished_tasks: RwLock<Vec<Task>>,
 }
 
 impl AppState {
     fn new() -> AppState {
         AppState {
-            current_number_tasks: 0,
-            index: 0,
-            queue: Queue::new(),
+            queue: RwLock::new(Queue::new()),
+            finished_tasks: RwLock::new(Vec::new()),
         }
     }
 }
 type SharedAppState = Arc<AppState>;
 
-const MAX_CONCURRENT_TASKS: u8 = 2;
+const MAX_WORKER_THREAD: u8 = 5;
 
 #[tokio::main]
 async fn main() {
     // initialize tracing
     tracing_subscriber::fmt::init();
 
-    // Initialiazing the channel for sending the tasks to and from the computation thread
-    let (tx_task, rx_task) = std::sync::mpsc::channel::<Arc<RwLock<Task>>>();
-
     // Initialiazing the shared state of the application
     let shared_state: SharedAppState = Arc::new(AppState::new());
 
-    // Channel used to keep track of the current number of tasks being computed
-    let (tx_nb, rx_nb) = std::sync::mpsc::channel::<u8>();
+    // Spawn MAX_WORKER_THREAD threads
+    for i in 0..MAX_WORKER_THREAD {
+        let worker_state = Arc::clone(&shared_state);
+        std::thread::spawn(move || {
+            {
+                println!("Start of the computation thread {}", i);
+                loop {
+                    let mut queue = worker_state.queue.write().unwrap();
+                    if let Some(mut task) = queue.dequeue() {
+                        drop(queue);
 
-    // Spawn the computation thread
-    std::thread::spawn(move || {
-        {
-            println!("Démarrage du thread de calcul");
-            loop {
-                println!("Début de la loop");
-                // When a new task is sent down the channel
-                let thread_task = rx_task.recv().unwrap();
-
-                let worker_tx_nb = tx_nb.clone();
-                // Spawn a worker thread for the task
-
-                std::thread::spawn(move || {
-                    // Acquire the lock on the task
-                    let task = thread_task.read().unwrap();
-
-                    println!("On commence à calculer");
-                    // Compute it synchronously
-                    let result = task.compute();
-                    println!("On finit de calculer");
-                    drop(task);
-
-                    println!("{:?}", result);
-
-                    println!("On met à jour la tâche");
-                    thread_task.write().unwrap().result = Some(result);
-
-                    // Tell the main thread a task is finished
-                    worker_tx_nb.send(1).unwrap();
-                });
-
-                println!("Fin de la loop");
+                        println!("Thread {i} : Beginning of task {}", task.duration);
+                        compute(&mut task);
+                        println!("Thread {i} : Result {:?}", task.result);
+                        
+                        worker_state.finished_tasks.write().unwrap().push(task);
+                    }
+                }
             }
-        }
-    });
+        });
+    }
 
-    // Spawn the feeder thread
-    let feeder_state = Arc::clone(&shared_state);
-    std::thread::spawn(move || {
-        let mut current_number_tasks = 0;
-        let mut index = 0;
-        loop {
-            let state = feeder_state;
-            let tasks = &state.queue.tasks;
-
-            if current_number_tasks < MAX_CONCURRENT_TASKS && index < tasks.len() {
-                let task_to_feed: Arc<RwLock<Task>> = Arc::clone(&tasks[index]);
-                tx_task.send(task_to_feed).unwrap();
-                index += 1;
-                current_number_tasks += 1;
-            }
-
-            if let Ok(_) = rx_nb.recv_timeout(Duration::from_millis(100)) {
-                current_number_tasks -= 1;
-            };
-        }
-    });
-
-    // build our application with a route
+    // Add routes to application
     let app = Router::new()
         .route("/tasks", get(tasks))
         .route("/tasks", post(create_task))
         .with_state(Arc::clone(&shared_state));
 
-    // run our app with hyper
-    // `axum::Server` is a re-export of `hyper::Server`
+    // Listen on port 3000
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     tracing::debug!("listening on {}", addr);
     axum::Server::bind(&addr)
@@ -121,66 +75,75 @@ async fn main() {
 
 #[debug_handler]
 async fn tasks(state: State<SharedAppState>) -> Json<Vec<Task>> {
-    let queue = state..queue.tasks.clone();
-    Json(
-        queue
-            .iter()
-            .map(|task| task.read().unwrap().clone())
-            .collect(),
-    )
+    let queue = state.queue.read().unwrap().tasks.to_vec();
+    let finished_tasks = state.finished_tasks.read().unwrap().to_vec();
+    Json([queue, finished_tasks].concat())
 }
 
 #[debug_handler]
-async fn create_task(state: State<SharedAppState>, Json(payload): Json<Task>) -> Json<Task> {
+async fn create_task(state: State<SharedAppState>, Json(payload): Json<CreateTask>) -> Json<Task> {
     let task = Task {
         duration: payload.duration,
         result: None,
+        state: TaskState::NotStarted
     };
 
     let task_to_return = task.clone();
-    state.queue.enqueue(task);
+    state.queue.write().unwrap().enqueue(task);
 
     Json(task_to_return)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn compute(task: &mut Task) {
+    let duration: u64 = task.duration as u64;
+    task.state = TaskState::InProgress;
+    std::thread::sleep(Duration::from_secs(duration));
+    task.result = Some(duration);
+    task.state = TaskState::Finished;
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct Task {
     duration: u64,
     result: Option<u64>,
+    state: TaskState
 }
 
-impl Task {
-    fn compute(&self) -> u64 {
-        let duration: u64 = self.duration as u64;
-        std::thread::sleep(Duration::from_secs(duration));
-        duration
-    }
+#[derive(Debug, Clone, Deserialize)]
+struct CreateTask {
+    duration: u64,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone, Serialize)]
+enum TaskState {
+    NotStarted,
+    InProgress,
+    Cancelled,
+    Finished,
+    Error
+}
+
+#[derive(Debug, Default)]
 struct Queue {
-    tasks: Vec<Arc<RwLock<Task>>>,
+    tasks: Vec<Task>,
 }
 
 impl Queue {
     fn new() -> Queue {
         Queue {
-            tasks: vec![
-                Arc::new(RwLock::new(Task {
-                    duration: 3,
-                    result: None,
-                })),
-                Arc::new(RwLock::new(Task {
-                    duration: 5,
-                    result: None,
-                })),
-            ],
+            tasks: Vec::new(),
         }
     }
 
-    fn enqueue(&mut self, task: Task) -> Arc<RwLock<Task>> {
-        let task = Arc::new(RwLock::new(task));
-        self.tasks.push(Arc::clone(&task));
-        task
+    fn enqueue(&mut self, task: Task) {
+        self.tasks.insert(0, task);
+    }
+
+    fn dequeue(&mut self) -> Option<Task> {
+        self.tasks.pop()
+    }
+
+    fn size(&self) -> usize {
+        self.tasks.len()
     }
 }
