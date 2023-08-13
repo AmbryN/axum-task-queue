@@ -8,10 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     net::SocketAddr,
-    sync::{atomic::AtomicU64, Arc, RwLock}
+    sync::{atomic::AtomicU64, Arc, RwLock},
+    time::Duration,
 };
 
 struct AppState {
+    threads: AtomicU64,
     created_tasks: AtomicU64,
     queue: RwLock<VecDeque<Task>>,
     running_tasks: RwLock<Vec<Task>>,
@@ -21,6 +23,7 @@ struct AppState {
 impl AppState {
     fn new() -> AppState {
         AppState {
+            threads: AtomicU64::new(0),
             created_tasks: AtomicU64::new(0),
             queue: RwLock::new(VecDeque::new()),
             running_tasks: RwLock::new(Vec::new()),
@@ -30,7 +33,7 @@ impl AppState {
 }
 type SharedAppState = Arc<AppState>;
 
-const MAX_WORKER_THREAD: u8 = 10;
+const MAX_WORKER_THREADS: u64 = 8;
 
 #[tokio::main]
 async fn main() {
@@ -40,28 +43,45 @@ async fn main() {
     // Initialiazing the shared state of the application
     let shared_state: SharedAppState = Arc::new(AppState::new());
 
-    // Spawn MAX_WORKER_THREAD threads
-    for i in 0..MAX_WORKER_THREAD {
-        let worker_state = Arc::clone(&shared_state);
-        std::thread::spawn(move || {
-            println!("Start of the computation thread {}", i);
-            loop {
-                let mut queue = worker_state.queue.write().unwrap();
-                if let Some(mut task) = queue.pop_front() {
-                    drop(queue);
+    // Spawn feeder thread
+    let worker_state = Arc::clone(&shared_state);
+    std::thread::spawn(move || loop {
+        let current_number_threads = worker_state
+        .threads
+        .load(std::sync::atomic::Ordering::Relaxed);
+    
+    if current_number_threads < MAX_WORKER_THREADS {
+            let mut queue = worker_state.queue.write().unwrap();
+            if let Some(mut task) = queue.pop_front() {
+                // Drop the queue to release the lock
+                drop(queue);
 
+                // Increase the number of running threads
+                let current_thread = worker_state
+                    .threads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                // Copy the state to pass it into the worker thread
+                let worker_state = Arc::clone(&worker_state);
+                std::thread::spawn(move || {
+                    println!("Start of the worker thread {}", current_number_threads);
+
+                    // Add the task to the running tasks to keep track of their status
                     task.state = TaskState::InProgress;
-
                     let mut running_tasks = worker_state.running_tasks.write().unwrap();
                     running_tasks.push(task.clone());
                     drop(running_tasks);
 
-                    println!("Thread {i} : Beginning of task {}", task.duration);
+                    // Start computing the task
+                    println!(
+                        "Thread {current_thread} : Beginning of task {} with iterations {}",
+                        task.id, task.duration
+                    );
                     compute(&mut task);
-                    println!("Thread {i} : Result {:?}", task.result);
-
+                    println!("Thread {current_thread} : Task {} has Result {:?}", task.id, task.result);
                     task.state = TaskState::Finished;
 
+                    // Remove the task from the running tasks
                     let mut running_tasks = worker_state.running_tasks.write().unwrap();
                     let index = running_tasks
                         .iter()
@@ -69,12 +89,26 @@ async fn main() {
                         .expect("needle not found");
                     running_tasks.remove(index);
                     drop(running_tasks);
-
+                    
+                    // Add the task to the finished tasks
                     worker_state.finished_tasks.write().unwrap().push(task);
-                }
+
+                    // Reduce the number of working threads
+                    worker_state
+                        .threads
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                });
+            } else {
+                // Drop the queue to release the lock before waiting
+                drop(queue);
+                // Sleep in order to reduce impact of infinite loop
+                std::thread::sleep(Duration::from_millis(100))
             }
-        });
-    }
+        } else {
+            // Sleep in order to reduce impact of infinite loop
+            std::thread::sleep(Duration::from_millis(100))
+        }
+    });
 
     // Add routes to application
     let app = Router::new()
@@ -93,6 +127,7 @@ async fn main() {
 
 #[debug_handler]
 async fn tasks(state: State<SharedAppState>) -> Json<Vec<Task>> {
+    // Fetch all the task : queued, running and finished
     let queue: Vec<Task> = state.queue.read().unwrap().clone().into();
     let running_tasks = state.running_tasks.read().unwrap().clone();
     let finished_tasks = state.finished_tasks.read().unwrap().to_vec();
@@ -101,12 +136,14 @@ async fn tasks(state: State<SharedAppState>) -> Json<Vec<Task>> {
 
 #[debug_handler]
 async fn create_task(state: State<SharedAppState>, Json(payload): Json<CreateTask>) -> Json<Task> {
+    // Create a task from the payload
     let created_tasks = state
         .created_tasks
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let task = Task::new(created_tasks, payload.duration);
 
     let task_to_return = task.clone();
+    // Queue the task
     state.queue.write().unwrap().push_back(task);
 
     Json(task_to_return)
@@ -121,7 +158,8 @@ fn compute(task: &mut Task) {
 
 fn fibonacci(nb: u64) -> u64 {
     let (mut x, mut y) = (0, 1);
-    for _ in 0..10_000_000 {
+    // Long running computation
+    for _ in 0..20_000_000 {
         (x, y) = (0, 1);
         for _ in 0..nb {
             let temp = x;
