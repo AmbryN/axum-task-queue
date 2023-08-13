@@ -6,27 +6,31 @@ use axum::{
 use axum_macros::debug_handler;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     net::SocketAddr,
-    sync::{Arc, RwLock},
-    time::Duration,
+    sync::{atomic::AtomicU64, Arc, RwLock}
 };
 
 struct AppState {
-    queue: RwLock<Queue>,
+    created_tasks: AtomicU64,
+    queue: RwLock<VecDeque<Task>>,
+    running_tasks: RwLock<Vec<Task>>,
     finished_tasks: RwLock<Vec<Task>>,
 }
 
 impl AppState {
     fn new() -> AppState {
         AppState {
-            queue: RwLock::new(Queue::new()),
+            created_tasks: AtomicU64::new(0),
+            queue: RwLock::new(VecDeque::new()),
+            running_tasks: RwLock::new(Vec::new()),
             finished_tasks: RwLock::new(Vec::new()),
         }
     }
 }
 type SharedAppState = Arc<AppState>;
 
-const MAX_WORKER_THREAD: u8 = 5;
+const MAX_WORKER_THREAD: u8 = 10;
 
 #[tokio::main]
 async fn main() {
@@ -40,19 +44,33 @@ async fn main() {
     for i in 0..MAX_WORKER_THREAD {
         let worker_state = Arc::clone(&shared_state);
         std::thread::spawn(move || {
-            {
-                println!("Start of the computation thread {}", i);
-                loop {
-                    let mut queue = worker_state.queue.write().unwrap();
-                    if let Some(mut task) = queue.dequeue() {
-                        drop(queue);
+            println!("Start of the computation thread {}", i);
+            loop {
+                let mut queue = worker_state.queue.write().unwrap();
+                if let Some(mut task) = queue.pop_front() {
+                    drop(queue);
 
-                        println!("Thread {i} : Beginning of task {}", task.duration);
-                        compute(&mut task);
-                        println!("Thread {i} : Result {:?}", task.result);
-                        
-                        worker_state.finished_tasks.write().unwrap().push(task);
-                    }
+                    task.state = TaskState::InProgress;
+
+                    let mut running_tasks = worker_state.running_tasks.write().unwrap();
+                    running_tasks.push(task.clone());
+                    drop(running_tasks);
+
+                    println!("Thread {i} : Beginning of task {}", task.duration);
+                    compute(&mut task);
+                    println!("Thread {i} : Result {:?}", task.result);
+
+                    task.state = TaskState::Finished;
+
+                    let mut running_tasks = worker_state.running_tasks.write().unwrap();
+                    let index = running_tasks
+                        .iter()
+                        .position(|x| *x == task)
+                        .expect("needle not found");
+                    running_tasks.remove(index);
+                    drop(running_tasks);
+
+                    worker_state.finished_tasks.write().unwrap().push(task);
                 }
             }
         });
@@ -75,38 +93,68 @@ async fn main() {
 
 #[debug_handler]
 async fn tasks(state: State<SharedAppState>) -> Json<Vec<Task>> {
-    let queue = state.queue.read().unwrap().tasks.to_vec();
+    let queue: Vec<Task> = state.queue.read().unwrap().clone().into();
+    let running_tasks = state.running_tasks.read().unwrap().clone();
     let finished_tasks = state.finished_tasks.read().unwrap().to_vec();
-    Json([queue, finished_tasks].concat())
+    Json([queue, running_tasks, finished_tasks].concat())
 }
 
 #[debug_handler]
 async fn create_task(state: State<SharedAppState>, Json(payload): Json<CreateTask>) -> Json<Task> {
-    let task = Task {
-        duration: payload.duration,
-        result: None,
-        state: TaskState::NotStarted
-    };
+    let created_tasks = state
+        .created_tasks
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let task = Task::new(created_tasks, payload.duration);
 
     let task_to_return = task.clone();
-    state.queue.write().unwrap().enqueue(task);
+    state.queue.write().unwrap().push_back(task);
 
     Json(task_to_return)
 }
 
 fn compute(task: &mut Task) {
     let duration: u64 = task.duration as u64;
-    task.state = TaskState::InProgress;
-    std::thread::sleep(Duration::from_secs(duration));
-    task.result = Some(duration);
-    task.state = TaskState::Finished;
+    // std::thread::sleep(Duration::from_secs(duration));
+    let result = fibonacci(duration);
+    task.result = Some(result);
+}
+
+fn fibonacci(nb: u64) -> u64 {
+    let (mut x, mut y) = (0, 1);
+    for _ in 0..10_000_000 {
+        (x, y) = (0, 1);
+        for _ in 0..nb {
+            let temp = x;
+            x = y;
+            y = x + temp;
+        }
+    }
+    return x;
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct Task {
+    id: u64,
     duration: u64,
     result: Option<u64>,
-    state: TaskState
+    state: TaskState,
+}
+
+impl Task {
+    fn new(id: u64, duration: u64) -> Task {
+        Task {
+            id: id,
+            duration: duration,
+            result: None,
+            state: TaskState::NotStarted,
+        }
+    }
+}
+
+impl PartialEq for Task {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,36 +162,11 @@ struct CreateTask {
     duration: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 enum TaskState {
     NotStarted,
     InProgress,
     Cancelled,
     Finished,
-    Error
-}
-
-#[derive(Debug, Default)]
-struct Queue {
-    tasks: Vec<Task>,
-}
-
-impl Queue {
-    fn new() -> Queue {
-        Queue {
-            tasks: Vec::new(),
-        }
-    }
-
-    fn enqueue(&mut self, task: Task) {
-        self.tasks.insert(0, task);
-    }
-
-    fn dequeue(&mut self) -> Option<Task> {
-        self.tasks.pop()
-    }
-
-    fn size(&self) -> usize {
-        self.tasks.len()
-    }
+    Error,
 }
