@@ -6,23 +6,21 @@ use axum::{
 use axum_macros::debug_handler;
 use serde::{Deserialize, Serialize};
 use std::{
-    char::MAX,
-    sync::{
-        mpsc::{self, Sender},
-        Mutex,
-    },
-    thread::Thread,
-    time::Duration, collections::VecDeque,
-};
-use std::{
     collections::HashSet,
     net::SocketAddr,
     sync::{atomic::AtomicU64, Arc, RwLock},
 };
+use std::{
+    hash::{Hash, Hasher},
+    sync::{
+        mpsc::{self, Sender},
+        Mutex,
+    },
+};
+use task_queue::ThreadPool;
 
 struct AppState {
     tx_task: Mutex<Sender<Task>>,
-    threads: AtomicU64,
     created_tasks: AtomicU64,
     running_tasks: RwLock<HashSet<Task>>,
     finished_tasks: RwLock<HashSet<Task>>,
@@ -32,7 +30,6 @@ impl AppState {
     fn new(tx: Sender<Task>) -> AppState {
         AppState {
             tx_task: Mutex::new(tx),
-            threads: AtomicU64::new(0),
             created_tasks: AtomicU64::new(0),
             running_tasks: RwLock::new(HashSet::new()),
             finished_tasks: RwLock::new(HashSet::new()),
@@ -41,7 +38,7 @@ impl AppState {
 }
 type SharedAppState = Arc<AppState>;
 
-const MAX_CONCURRENT_THREADS: usize = 2;
+const MAX_CONCURRENT_THREADS: usize = 1;
 
 #[tokio::main]
 async fn main() {
@@ -50,6 +47,9 @@ async fn main() {
 
     // Create the channel for passing tasks
     let (tx, rx) = mpsc::channel::<Task>();
+
+    // Create the thread pool for computing the tasks
+    let thread_pool = ThreadPool::new(MAX_CONCURRENT_THREADS);
 
     // Initialiazing the shared state of the application
     let shared_state: SharedAppState = Arc::new(AppState::new(tx));
@@ -62,44 +62,32 @@ async fn main() {
 
         // Copy the state to pass it into the worker thread
         let worker_state = Arc::clone(&worker_state);
-        std::thread::spawn(move || {
-            // Increment the number of running threads
-            let thread = worker_state
-                .threads
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            println!("Start of the worker thread {}", thread);
-
+        // Add a task to the thread pool for computation
+        thread_pool.execute(move || {
             // Add the task to the running tasks to keep track of their status
             task.state = TaskState::InProgress;
-            let mut running_tasks = worker_state.running_tasks.write().unwrap();
-            running_tasks.insert(task.clone());
-            drop(running_tasks);
+
+            worker_state
+                .running_tasks
+                .write()
+                .unwrap()
+                .insert(task.clone());
 
             // Start computing the task
             println!(
-                "Thread {thread} : Beginning of task {} with iterations {}",
+                "Beginning of task {} with iterations {}",
                 task.id, task.duration
             );
             compute(&mut task);
-            println!(
-                "Thread {thread} : Task {} has Result {:?}",
-                task.id, task.result
-            );
+            println!("Task {} has Result {:?}", task.id, task.result);
             task.state = TaskState::Finished;
 
             // Remove the task from the running tasks
-            let mut running_tasks = worker_state.running_tasks.write().unwrap();
-            running_tasks.remove(&task);
-            drop(running_tasks);
+            worker_state.running_tasks.write().unwrap().remove(&task);
 
             // Add the task to the finished tasks
             worker_state.finished_tasks.write().unwrap().insert(task);
-
-            // Decrement the number of working threads
-            worker_state
-                .threads
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });
     });
 
@@ -160,20 +148,6 @@ fn compute(task: &mut Task) {
     task.result = Some(result);
 }
 
-fn fibonacci(nb: u64) -> u64 {
-    let (mut x, mut y) = (0, 1);
-    // Long running computation
-    for _ in 0..20_000_000 {
-        (x, y) = (0, 1);
-        for _ in 0..nb {
-            let temp = x;
-            x = y;
-            y = x + temp;
-        }
-    }
-    return x;
-}
-
 fn nth_prime(mut n: u64) -> u64 {
     let mut i = 2;
     while n > 0 {
@@ -207,15 +181,7 @@ fn is_prime(n: u64) -> bool {
     return true;
 }
 
-fn factorial(nb: u64) -> u64 {
-    if nb == 0 || nb == 1 {
-        1
-    } else {
-        nb * factorial(nb - 1)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Hash, Eq)]
+#[derive(Debug, Clone, Serialize)]
 struct Task {
     id: u64,
     duration: u64,
@@ -237,6 +203,14 @@ impl Task {
 impl PartialEq for Task {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
+    }
+}
+
+impl Eq for Task {}
+
+impl Hash for Task {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
     }
 }
 
