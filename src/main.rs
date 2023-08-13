@@ -6,26 +6,34 @@ use axum::{
 use axum_macros::debug_handler;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{VecDeque, HashSet},
+    char::MAX,
+    sync::{
+        mpsc::{self, Sender},
+        Mutex,
+    },
+    thread::Thread,
+    time::Duration, collections::VecDeque,
+};
+use std::{
+    collections::HashSet,
     net::SocketAddr,
     sync::{atomic::AtomicU64, Arc, RwLock},
-    time::Duration,
 };
 
 struct AppState {
+    tx_task: Mutex<Sender<Task>>,
     threads: AtomicU64,
     created_tasks: AtomicU64,
-    queue: RwLock<VecDeque<Task>>,
     running_tasks: RwLock<HashSet<Task>>,
     finished_tasks: RwLock<HashSet<Task>>,
 }
 
 impl AppState {
-    fn new() -> AppState {
+    fn new(tx: Sender<Task>) -> AppState {
         AppState {
+            tx_task: Mutex::new(tx),
             threads: AtomicU64::new(0),
             created_tasks: AtomicU64::new(0),
-            queue: RwLock::new(VecDeque::new()),
             running_tasks: RwLock::new(HashSet::new()),
             finished_tasks: RwLock::new(HashSet::new()),
         }
@@ -33,81 +41,66 @@ impl AppState {
 }
 type SharedAppState = Arc<AppState>;
 
-const MAX_WORKER_THREADS: u64 = 8;
+const MAX_CONCURRENT_THREADS: usize = 2;
 
 #[tokio::main]
 async fn main() {
     // initialize tracing
     tracing_subscriber::fmt::init();
 
+    // Create the channel for passing tasks
+    let (tx, rx) = mpsc::channel::<Task>();
+
     // Initialiazing the shared state of the application
-    let shared_state: SharedAppState = Arc::new(AppState::new());
+    let shared_state: SharedAppState = Arc::new(AppState::new(tx));
 
     // Spawn feeder thread
     let worker_state = Arc::clone(&shared_state);
     std::thread::spawn(move || loop {
-        let current_number_threads = worker_state
-        .threads
-        .load(std::sync::atomic::Ordering::Relaxed);
-    
-    if current_number_threads < MAX_WORKER_THREADS {
-            let mut queue = worker_state.queue.write().unwrap();
-            if let Some(mut task) = queue.pop_front() {
-                // Drop the queue to release the lock
-                drop(queue);
+        // Read task from the channel (blocks until a task is available)
+        let mut task = rx.recv().unwrap();
 
-                // Increase the number of running threads
-                let current_thread = worker_state
-                    .threads
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Copy the state to pass it into the worker thread
+        let worker_state = Arc::clone(&worker_state);
+        std::thread::spawn(move || {
+            // Increment the number of running threads
+            let thread = worker_state
+                .threads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                // Copy the state to pass it into the worker thread
-                let worker_state = Arc::clone(&worker_state);
-                std::thread::spawn(move || {
-                    println!("Start of the worker thread {}", current_number_threads);
+            println!("Start of the worker thread {}", thread);
 
-                    // Add the task to the running tasks to keep track of their status
-                    task.state = TaskState::InProgress;
-                    let mut running_tasks = worker_state.running_tasks.write().unwrap();
-                    running_tasks.insert(task.clone());
-                    drop(running_tasks);
+            // Add the task to the running tasks to keep track of their status
+            task.state = TaskState::InProgress;
+            let mut running_tasks = worker_state.running_tasks.write().unwrap();
+            running_tasks.insert(task.clone());
+            drop(running_tasks);
 
-                    // Start computing the task
-                    println!(
-                        "Thread {current_thread} : Beginning of task {} with iterations {}",
-                        task.id, task.duration
-                    );
-                    compute(&mut task);
-                    println!("Thread {current_thread} : Task {} has Result {:?}", task.id, task.result);
-                    task.state = TaskState::Finished;
+            // Start computing the task
+            println!(
+                "Thread {thread} : Beginning of task {} with iterations {}",
+                task.id, task.duration
+            );
+            compute(&mut task);
+            println!(
+                "Thread {thread} : Task {} has Result {:?}",
+                task.id, task.result
+            );
+            task.state = TaskState::Finished;
 
-                    // Remove the task from the running tasks
-                    let mut running_tasks = worker_state.running_tasks.write().unwrap();
-                    // let index = running_tasks
-                    //     .iter()
-                    //     .position(|x| *x == task)
-                    //     .expect("needle not found");
-                    running_tasks.remove(&task);
-                    drop(running_tasks);
-                    
-                    // Add the task to the finished tasks
-                    worker_state.finished_tasks.write().unwrap().insert(task);
+            // Remove the task from the running tasks
+            let mut running_tasks = worker_state.running_tasks.write().unwrap();
+            running_tasks.remove(&task);
+            drop(running_tasks);
 
-                    // Reduce the number of working threads
-                    worker_state
-                        .threads
-                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                });
-            } else {
-                // Drop the queue to release the lock before waiting
-                drop(queue);
-                // Sleep in order to reduce impact of infinite loop
-                std::thread::sleep(Duration::from_millis(100))
-            }
-        } else {
-            // Sleep in order to reduce impact of infinite loop
-            std::thread::sleep(Duration::from_millis(100))
-        }
+            // Add the task to the finished tasks
+            worker_state.finished_tasks.write().unwrap().insert(task);
+
+            // Decrement the number of working threads
+            worker_state
+                .threads
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        });
     });
 
     // Add routes to application
@@ -127,11 +120,22 @@ async fn main() {
 
 #[debug_handler]
 async fn tasks(state: State<SharedAppState>) -> Json<Vec<Task>> {
-    // Fetch all the task : queued, running and finished
-    let queue: Vec<Task> = state.queue.read().unwrap().clone().into();
-    let running_tasks = state.running_tasks.read().unwrap().clone().into_iter().collect();
-    let finished_tasks = state.finished_tasks.read().unwrap().clone().into_iter().collect();
-    Json([queue, running_tasks, finished_tasks].concat())
+    // Fetch all the task : running and finished
+    let running_tasks: Vec<Task> = state
+        .running_tasks
+        .read()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .collect();
+    let finished_tasks = state
+        .finished_tasks
+        .read()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .collect();
+    Json([running_tasks, finished_tasks].concat())
 }
 
 #[debug_handler]
@@ -143,16 +147,16 @@ async fn create_task(state: State<SharedAppState>, Json(payload): Json<CreateTas
     let task = Task::new(created_tasks, payload.duration);
 
     let task_to_return = task.clone();
-    // Queue the task
-    state.queue.write().unwrap().push_back(task);
+
+    // Pass task into the channel
+    state.tx_task.lock().unwrap().send(task).unwrap();
 
     Json(task_to_return)
 }
 
 fn compute(task: &mut Task) {
     let duration: u64 = task.duration as u64;
-    // std::thread::sleep(Duration::from_secs(duration));
-    let result = fibonacci(duration);
+    let result = nth_prime(duration);
     task.result = Some(result);
 }
 
@@ -168,6 +172,47 @@ fn fibonacci(nb: u64) -> u64 {
         }
     }
     return x;
+}
+
+fn nth_prime(mut n: u64) -> u64 {
+    let mut i = 2;
+    while n > 0 {
+        if is_prime(i) {
+            n -= 1;
+        }
+        i += 1;
+    }
+    i -= 1;
+    return i;
+}
+
+fn is_prime(n: u64) -> bool {
+    if n <= 1 {
+        return false;
+    }
+    if n == 2 || n == 3 {
+        return true;
+    }
+    // below 5 there is only two prime numbers 2 and 3
+    if n % 2 == 0 || n % 3 == 0 {
+        return false;
+    }
+    // Using concept of prime number can be represented
+    // in form of (6*k + 1) or(6*k - 1)
+    for i in (5..(1 + ((n as f64).powf(0.5)) as u64)).step_by(6) {
+        if n % i == 0 || n % (i + 2) == 0 {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn factorial(nb: u64) -> u64 {
+    if nb == 0 || nb == 1 {
+        1
+    } else {
+        nb * factorial(nb - 1)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Hash, Eq)]
