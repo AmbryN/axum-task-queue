@@ -6,7 +6,7 @@ use axum::{
 use axum_macros::debug_handler;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{VecDeque, HashSet},
     net::SocketAddr,
     sync::{atomic::AtomicU64, Arc, RwLock},
     time::Duration,
@@ -16,8 +16,8 @@ struct AppState {
     threads: AtomicU64,
     created_tasks: AtomicU64,
     queue: RwLock<VecDeque<Task>>,
-    running_tasks: RwLock<Vec<Task>>,
-    finished_tasks: RwLock<Vec<Task>>,
+    running_tasks: RwLock<HashSet<Task>>,
+    finished_tasks: RwLock<HashSet<Task>>,
 }
 
 impl AppState {
@@ -26,8 +26,8 @@ impl AppState {
             threads: AtomicU64::new(0),
             created_tasks: AtomicU64::new(0),
             queue: RwLock::new(VecDeque::new()),
-            running_tasks: RwLock::new(Vec::new()),
-            finished_tasks: RwLock::new(Vec::new()),
+            running_tasks: RwLock::new(HashSet::new()),
+            finished_tasks: RwLock::new(HashSet::new()),
         }
     }
 }
@@ -69,7 +69,7 @@ async fn main() {
                     // Add the task to the running tasks to keep track of their status
                     task.state = TaskState::InProgress;
                     let mut running_tasks = worker_state.running_tasks.write().unwrap();
-                    running_tasks.push(task.clone());
+                    running_tasks.insert(task.clone());
                     drop(running_tasks);
 
                     // Start computing the task
@@ -83,15 +83,15 @@ async fn main() {
 
                     // Remove the task from the running tasks
                     let mut running_tasks = worker_state.running_tasks.write().unwrap();
-                    let index = running_tasks
-                        .iter()
-                        .position(|x| *x == task)
-                        .expect("needle not found");
-                    running_tasks.remove(index);
+                    // let index = running_tasks
+                    //     .iter()
+                    //     .position(|x| *x == task)
+                    //     .expect("needle not found");
+                    running_tasks.remove(&task);
                     drop(running_tasks);
                     
                     // Add the task to the finished tasks
-                    worker_state.finished_tasks.write().unwrap().push(task);
+                    worker_state.finished_tasks.write().unwrap().insert(task);
 
                     // Reduce the number of working threads
                     worker_state
@@ -129,8 +129,8 @@ async fn main() {
 async fn tasks(state: State<SharedAppState>) -> Json<Vec<Task>> {
     // Fetch all the task : queued, running and finished
     let queue: Vec<Task> = state.queue.read().unwrap().clone().into();
-    let running_tasks = state.running_tasks.read().unwrap().clone();
-    let finished_tasks = state.finished_tasks.read().unwrap().to_vec();
+    let running_tasks = state.running_tasks.read().unwrap().clone().into_iter().collect();
+    let finished_tasks = state.finished_tasks.read().unwrap().clone().into_iter().collect();
     Json([queue, running_tasks, finished_tasks].concat())
 }
 
@@ -170,7 +170,7 @@ fn fibonacci(nb: u64) -> u64 {
     return x;
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Hash, Eq)]
 struct Task {
     id: u64,
     duration: u64,
@@ -200,7 +200,7 @@ struct CreateTask {
     duration: u64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 enum TaskState {
     NotStarted,
     InProgress,
