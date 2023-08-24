@@ -6,24 +6,22 @@ use axum::{
 use axum_macros::debug_handler;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
-    net::SocketAddr,
-    sync::{atomic::AtomicU64, Arc, RwLock},
-};
-use std::{
     hash::{Hash, Hasher},
     sync::{
         mpsc::{self, Sender},
         Mutex,
     },
 };
+use std::{
+    net::SocketAddr,
+    sync::{atomic::AtomicU64, Arc, RwLock},
+};
 use task_queue::ThreadPool;
 
 struct AppState {
     tx_task: Mutex<Sender<Task>>,
     created_tasks: AtomicU64,
-    running_tasks: RwLock<HashSet<Task>>,
-    finished_tasks: RwLock<HashSet<Task>>,
+    tasks: RwLock<Vec<Arc<RwLock<Task>>>>,
 }
 
 impl AppState {
@@ -31,14 +29,13 @@ impl AppState {
         AppState {
             tx_task: Mutex::new(tx),
             created_tasks: AtomicU64::new(0),
-            running_tasks: RwLock::new(HashSet::new()),
-            finished_tasks: RwLock::new(HashSet::new()),
+            tasks: RwLock::new(Vec::new()),
         }
     }
 }
 type SharedAppState = Arc<AppState>;
 
-const MAX_CONCURRENT_THREADS: usize = 1;
+const MAX_CONCURRENT_THREADS: usize = 3;
 
 #[tokio::main]
 async fn main() {
@@ -58,36 +55,27 @@ async fn main() {
     let worker_state = Arc::clone(&shared_state);
     std::thread::spawn(move || loop {
         // Read task from the channel (blocks until a task is available)
-        let mut task = rx.recv().unwrap();
+        let task = rx.recv().unwrap();
 
-        // Copy the state to pass it into the worker thread
-        let worker_state = Arc::clone(&worker_state);
+        // Arc is used to keep a reference on the task added to the list of tasks
+        // which is needed for computing it afterwards
+        let task = Arc::new(RwLock::new(task));
+
+        // Add the task to the list of tasks
+        worker_state.tasks.write().unwrap().push(Arc::clone(&task));
 
         // Add a task to the thread pool for computation
         thread_pool.execute(move || {
-            // Add the task to the running tasks to keep track of their status
-            task.state = TaskState::InProgress;
-
-            worker_state
-                .running_tasks
-                .write()
-                .unwrap()
-                .insert(task.clone());
+            task.write().unwrap().state = TaskState::InProgress;
+            let id = task.read().unwrap().id;
+            let duration = task.read().unwrap().duration;
 
             // Start computing the task
-            println!(
-                "Beginning of task {} with iterations {}",
-                task.id, task.duration
-            );
-            compute(&mut task);
-            println!("Task {} has Result {:?}", task.id, task.result);
-            task.state = TaskState::Finished;
-
-            // Remove the task from the running tasks
-            worker_state.running_tasks.write().unwrap().remove(&task);
-
-            // Add the task to the finished tasks
-            worker_state.finished_tasks.write().unwrap().insert(task);
+            println!("Beginning of task {} with iterations {}", id, duration);
+            let result = task.read().unwrap().compute();
+            println!("Task {} has Result {:?}", id, result);
+            task.write().unwrap().result = Some(result);
+            task.write().unwrap().state = TaskState::Finished;
         });
     });
 
@@ -108,22 +96,16 @@ async fn main() {
 
 #[debug_handler]
 async fn tasks(state: State<SharedAppState>) -> Json<Vec<Task>> {
-    // Fetch all the task : running and finished
-    let running_tasks: Vec<Task> = state
-        .running_tasks
+    // Fetch all the task : pending, running and finished
+    // For it to work, the task must not be locked during computation !
+    let tasks: Vec<Task> = state
+        .tasks
         .read()
         .unwrap()
-        .clone()
-        .into_iter()
+        .iter()
+        .map(|arc| arc.read().unwrap().clone())
         .collect();
-    let finished_tasks = state
-        .finished_tasks
-        .read()
-        .unwrap()
-        .clone()
-        .into_iter()
-        .collect();
-    Json([running_tasks, finished_tasks].concat())
+    Json(tasks)
 }
 
 #[debug_handler]
@@ -140,12 +122,6 @@ async fn create_task(state: State<SharedAppState>, Json(payload): Json<CreateTas
     state.tx_task.lock().unwrap().send(task).unwrap();
 
     Json(task_to_return)
-}
-
-fn compute(task: &mut Task) {
-    let duration: u64 = task.duration as u64;
-    let result = nth_prime(duration);
-    task.result = Some(result);
 }
 
 fn nth_prime(mut n: u64) -> u64 {
@@ -181,7 +157,7 @@ fn is_prime(n: u64) -> bool {
     return true;
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Eq)]
 struct Task {
     id: u64,
     duration: u64,
@@ -198,6 +174,11 @@ impl Task {
             state: TaskState::NotStarted,
         }
     }
+
+    fn compute(&self) -> u64 {
+        let result = nth_prime(self.duration);
+        result
+    }
 }
 
 impl PartialEq for Task {
@@ -205,8 +186,6 @@ impl PartialEq for Task {
         self.id == other.id
     }
 }
-
-impl Eq for Task {}
 
 impl Hash for Task {
     fn hash<H: Hasher>(&self, state: &mut H) {
